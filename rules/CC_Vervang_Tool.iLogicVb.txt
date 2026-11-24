@@ -551,6 +551,7 @@ Class CCBrowser
     Private _txtDetail As System.Windows.Forms.TextBox
     Private _btnOK As Button
     Private _btnCancel As Button
+    Private _keyKolommen As List(Of String)
     Friend GekozenPad As String = ""
 
     Public Sub New(ccTopNode As Object)
@@ -712,6 +713,7 @@ Class CCBrowser
         _txtDetail.Text = ""
         Try
             _lblFamilie.Text = CStr(fam.DisplayName)
+            _keyKolommen = BepaalKeyKolommen(fam)
             Dim n As Integer = 0
             For Each rij As Object In fam.TableRows
                 Dim it As New CCRowItem
@@ -728,20 +730,140 @@ Class CCBrowser
         End Try
     End Sub
 
-    Private Function RowTekst(rij As Object, idx As Integer) As String
-        Dim omschrijving As String = GeefCelwaardeMulti(rij, New String() {"description", "omschrijving", "beschrijving"})
-        Dim bestandsnaam As String = GeefCelwaardeMulti(rij, New String() {"filename", "file name", "bestandsnaam"})
-        Dim pn As String = GeefCelwaardeMulti(rij, New String() {"part number", "partnummer"})
+    ' Bepaalt welke kolommen als 
+    ' key columns gelden: eerst fam.KeyColumns (late-bound), daarna
+    ' kolommen met IsKeyColumn, anders leeg (want dan valt de code terug op
+    ' de vaste kolommen description/part number/filename).
+    Private Function BepaalKeyKolommen(fam As Object) As List(Of String)
+        Dim namen As New List(Of String)
 
-        Dim stukken As New List(Of String)
-        If omschrijving <> "" Then stukken.Add(omschrijving)
-        If pn <> "" Then stukken.Add(pn)
-        If bestandsnaam <> "" Then
-            Dim naamZonderExt As String = bestandsnaam
-            If LCase(naamZonderExt).EndsWith(".ipt") Then naamZonderExt = naamZonderExt.Substring(0, naamZonderExt.Length - 4)
-            stukken.Add(naamZonderExt)
+        ' A) KeyColumns-property van de familie (kan namen óf kolomobjecten geven)
+        Try
+            For Each k As Object In fam.KeyColumns
+                Dim nm As String = ""
+                Try
+                    nm = CStr(k.DisplayName)
+                Catch
+                    Try
+                        nm = CStr(k)
+                    Catch
+                    End Try
+                End Try
+                nm = Trim(nm)
+                If nm <> "" AndAlso Not namen.Contains(LCase(nm)) Then namen.Add(LCase(nm))
+            Next
+        Catch
+        End Try
+
+        ' B) kolommen die als key column gemarkeerd zijn
+        If namen.Count = 0 Then
+            Try
+                For Each col As Object In fam.TableColumns
+                    Dim isKey As Boolean = False
+                    Try
+                        isKey = CBool(col.IsKeyColumn)
+                    Catch
+                    End Try
+                    If isKey Then
+                        Dim nm As String = ""
+                        Try
+                            nm = CStr(col.DisplayName)
+                        Catch
+                            Try
+                                nm = CStr(col.HeaderName)
+                            Catch
+                            End Try
+                        End Try
+                        nm = Trim(nm)
+                        If nm <> "" AndAlso Not namen.Contains(LCase(nm)) Then namen.Add(LCase(nm))
+                    End If
+                Next
+            Catch
+            End Try
         End If
 
+        Return namen
+    End Function
+
+    Private Function KolomNaam(cel As Object) As String
+        Try
+            Return CStr(cel.Column.DisplayName)
+        Catch
+        End Try
+        Try
+            Return CStr(cel.Column.HeaderName)
+        Catch
+        End Try
+        Return ""
+    End Function
+
+    ' Geeft de waardes van de gevraagde kolommen als "kolom = waarde"
+    Private Function GeefWaardenVoorKolommen(rij As Object, kolomNamen As List(Of String)) As List(Of String)
+        Dim uit As New List(Of String)
+        Try
+            For Each cel As Object In rij.Cells
+                Dim kolom As String = LCase(KolomNaam(cel))
+                If kolom <> "" AndAlso kolomNamen.Contains(kolom) Then
+                    Dim val As String = ""
+                    Try
+                        val = CStr(cel.Value)
+                    Catch
+                    End Try
+                    uit.Add(Trim(KolomNaam(cel)) & " = " & val)
+                End If
+            Next
+        Catch
+        End Try
+        Return uit
+    End Function
+
+    Private Function RowTekst(rij As Object, idx As Integer) As String
+        Dim stukken As New List(Of String)
+
+        ' 1) inhoud van de key columns van deze familie
+        If _keyKolommen IsNot Nothing AndAlso _keyKolommen.Count > 0 Then
+            stukken.AddRange(GeefWaardenVoorKolommen(rij, _keyKolommen))
+        End If
+
+        ' 2) vaste kolommen: description | part number | bestandsnaam
+        If stukken.Count = 0 Then
+            Dim omschrijving As String = GeefCelwaardeMulti(rij, New String() {"description", "omschrijving", "beschrijving"})
+            Dim bestandsnaam As String = GeefCelwaardeMulti(rij, New String() {"filename", "file name", "bestandsnaam"})
+            Dim pn As String = GeefCelwaardeMulti(rij, New String() {"part number", "partnummer"})
+
+            If omschrijving <> "" Then stukken.Add(omschrijving)
+            If pn <> "" Then stukken.Add(pn)
+            If bestandsnaam <> "" Then
+                Dim naamZonderExt As String = bestandsnaam
+                If LCase(naamZonderExt).EndsWith(".ipt") Then naamZonderExt = naamZonderExt.Substring(0, naamZonderExt.Length - 4)
+                stukken.Add(naamZonderExt)
+            End If
+        End If
+
+        ' 3) laatste optie: eerste 3 kolommen die een waarde bevatten
+        If stukken.Count = 0 Then
+            Try
+                For Each cel As Object In rij.Cells
+                    Dim val As String = ""
+                    Try
+                        val = CStr(cel.Value)
+                    Catch
+                    End Try
+                    If val <> "" Then
+                        Dim kn As String = KolomNaam(cel)
+                        If kn <> "" Then
+                            stukken.Add(kn & " = " & val)
+                        Else
+                            stukken.Add(val)
+                        End If
+                    End If
+                    If stukken.Count >= 3 Then Exit For
+                Next
+            Catch
+            End Try
+        End If
+
+        ' 4) nog steeds niets: membernaam of rijnummer
         If stukken.Count = 0 Then
             Dim t As String = ""
             Try
