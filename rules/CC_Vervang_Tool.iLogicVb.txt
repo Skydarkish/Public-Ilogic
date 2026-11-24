@@ -1,0 +1,856 @@
+' =====================================================================
+'  Content Center vervang-tool (iLogic, Inventor 2026)
+'  - Doorzoekt assembly + alle subassembly's
+'  - Toont elke unieke Content Center onderdeel
+'  - Per regel vervangend onderdeel kiezen uit de CC-library (of van schijf)
+'  - Knop "Uitvoeren" vervangt het onderdeel overal (alle subassembly's)
+' =====================================================================
+
+AddReference "System.dll"
+AddReference "System.Drawing.dll"
+AddReference "System.Windows.Forms.dll"
+
+Imports System.IO
+Imports System.Windows.Forms
+Imports System.Collections.Generic
+
+Sub Main()
+    Dim oAsmDoc As AssemblyDocument = TryCast(ThisDoc.Document, AssemblyDocument)
+    If oAsmDoc Is Nothing Then
+        MessageBox.Show("Open allereerst een assembly voordat je deze regel start.", _
+            "Content Center vervang-tool", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        Return
+    End If
+
+    Dim oRijen As New List(Of CCRij)
+    Dim oBestanden As New List(Of CCBestand)
+
+    VerzamelCCOnderdelen(oAsmDoc.ComponentDefinition.Occurrences, oRijen)
+
+    If oRijen.Count = 0 Then
+        MessageBox.Show("Geen Content Center onderdelen gevonden in deze assembly (inclusief subassembly's).", _
+            "Content Center vervang-tool", MessageBoxButtons.OK, MessageBoxIcon.Information)
+        Return
+    End If
+
+    Dim oCCMap As String = BepaalCCMap(oRijen)
+    If oCCMap Is Nothing Then Return
+
+    ZoekIPTBestanden(oCCMap, oBestanden)
+    oBestanden.Sort(New CCBestandComparer)
+
+    Using frm As New CCForm(oRijen, oBestanden, oCCMap, GetCCTopNode())
+        If frm.ShowDialog() <> DialogResult.OK Then Return
+
+        Dim oVervangingen As Dictionary(Of String, String) = frm.Vervangingen
+        Dim tl As Integer = 0
+        Dim oMislukt As New List(Of String)
+
+        For Each kvp In oVervangingen
+            If String.Compare(kvp.Key, kvp.Value, True) = 0 Then Continue For
+            VervangInAssembly(oAsmDoc.ComponentDefinition.Occurrences, kvp.Key, kvp.Value, tl, oMislukt)
+        Next
+
+        Try
+            oAsmDoc.Update2()
+        Catch
+        End Try
+
+        MessageBox.Show("Klaar." & vbCrLf & tl & " onderdeelplaats(en) vervangen." & vbCrLf & _
+            oMislukt.Count & " mislukt.", "Content Center vervang-tool", _
+            MessageBoxButtons.OK, MessageBoxIcon.Information)
+    End Using
+End Sub
+
+' ============================ Hulpfuncties ============================
+
+Function GetCCTopNode() As Object
+    Try
+        Return ThisApplication.ContentCenter.TreeViewTopNode
+    Catch
+        Return Nothing
+    End Try
+End Function
+
+Function IsCCOnderdeel(oDoc As Document) As Boolean
+    ' Alle controles late-bound (As Object) omdat de property alleen op
+    ' PartComponentDefinition bestaat, niet op de basisclass ComponentDefinition.
+
+    ' 1) ComponentDefinition.IsContentCenterPart (officiele Inventor API-property)
+    Try
+        Dim oDefObj As Object = oDoc.ComponentDefinition
+        If CBool(oDefObj.IsContentCenterPart) Then Return True
+    Catch
+    End Try
+
+    ' 2) ComponentDefinition.IsContentCenter (variant voor het geval de
+    '    API-versie deze naam gebruikt)
+    Try
+        Dim oDefObj As Object = oDoc.ComponentDefinition
+        If CBool(oDefObj.IsContentCenter) Then Return True
+    Catch
+    End Try
+
+    ' 3) Document.IsContentCenter (late-bound; slaat over als de property
+    '    in deze versie niet bestaat)
+    Try
+        Dim oDocObj As Object = oDoc
+        If CBool(oDocObj.IsContentCenter) Then Return True
+    Catch
+    End Try
+
+    ' 4) ContentCenterDescriptor van de component-definitie
+    '    (aanwezig = onderdeel komt uit de Content Center)
+    Try
+        Dim oDefObj As Object = oDoc.ComponentDefinition
+        Dim oDescr As Object = oDefObj.ContentCenterDescriptor
+        If oDescr IsNot Nothing Then Return True
+    Catch
+    End Try
+
+    ' 5) Fallback: opzoeken in de Content Center-structuur (familieknoop)
+    Try
+        Return ThisApplication.ContentCenter.GetContentCenterNode(oDoc.InternalName) IsNot Nothing
+    Catch
+    End Try
+
+    ' 6) Laatste vangnet: mapcontrole op "content center files"
+    Try
+        If LCase(oDoc.FullFileName).Contains("content center files") Then Return True
+    Catch
+    End Try
+
+    Return False
+End Function
+
+Sub VerzamelCCOnderdelen(oOccs As ComponentOccurrences, rijen As List(Of CCRij))
+    For Each oOcc As ComponentOccurrence In oOccs
+        If oOcc.Suppressed Then Continue For
+        Try
+            Dim oDef As ComponentDefinition = oOcc.Definition
+            If oDef Is Nothing Then Continue For
+            Dim oDoc As Document = oDef.Document
+            If oDoc Is Nothing Then Continue For
+
+            If oDoc.DocumentType = DocumentTypeEnum.kAssemblyDocumentObject AndAlso oOcc.SubOccurrences IsNot Nothing Then
+                VerzamelCCOnderdelen(oOcc.SubOccurrences, rijen)
+            ElseIf oDoc.DocumentType = DocumentTypeEnum.kPartDocumentObject AndAlso IsCCOnderdeel(oDoc) Then
+                Dim sleutel As String = LCase(oDoc.FullFileName)
+                Dim bestaat As Boolean = False
+                For Each r As CCRij In rijen
+                    If LCase(r.Pad) = sleutel Then
+                        r.Aantal = r.Aantal + 1
+                        bestaat = True
+                        Exit For
+                    End If
+                Next
+                If Not bestaat Then
+                    Dim r As New CCRij
+                    r.Pad = oDoc.FullFileName
+                    r.Bestandsnaam = System.IO.Path.GetFileName(oDoc.FullFileName)
+
+                    Dim pn As String = ""
+                    Dim os As String = ""
+                    Try
+                        Dim oPset As PropertySet = oDoc.PropertySets.Item("Design Tracking Properties")
+                        pn = CStr(oPset.Item("Part Number").Value)
+                        os = CStr(oPset.Item("Description").Value)
+                    Catch
+                    End Try
+                    r.Partnummer = pn
+                    r.Omschrijving = os
+
+                    Dim fam As String = ""
+                    Try
+                        Dim oNode As Object = ThisApplication.ContentCenter.GetContentCenterNode(oDoc.InternalName)
+                        If oNode IsNot Nothing Then fam = oNode.Family.DisplayName
+                    Catch
+                    End Try
+                    r.Familie = fam
+
+                    r.Aantal = 1
+                    rijen.Add(r)
+                End If
+            End If
+        Catch
+        End Try
+    Next
+End Sub
+
+Function BepaalCCMap(rijen As List(Of CCRij)) As String
+    Try
+        Dim oDP As Object = ThisApplication.DesignProjectManager.ActiveDesignProject
+        Dim pads As Object = oDP.ContentCenterFiles
+        If pads IsNot Nothing AndAlso pads.Count > 0 Then
+            Dim waarde As String = CStr(pads.Item(1))
+            If waarde IsNot Nothing AndAlso waarde <> "" Then
+                If Directory.Exists(waarde) Then Return waarde
+                Dim dirAs As String = System.IO.Path.GetDirectoryName(waarde)
+                If dirAs <> "" AndAlso Directory.Exists(dirAs) Then Return dirAs
+            End If
+        End If
+    Catch
+    End Try
+    Try
+        Dim ouders As New List(Of String)
+        For Each r As CCRij In rijen
+            Dim ouder As String = System.IO.Path.GetDirectoryName(r.Pad)
+            While ouder <> "" AndAlso Not LCase(System.IO.Path.GetFileName(ouder)).Contains("content center")
+                ouder = System.IO.Path.GetDirectoryName(ouder)
+            End While
+            If ouder <> "" AndAlso Directory.Exists(ouder) AndAlso Not ouders.Contains(ouder) Then
+                ouders.Add(ouder)
+            End If
+        Next
+        If ouders.Count > 0 Then Return ouders(0)
+    Catch
+    End Try
+    Try
+        Dim opties As New List(Of String)
+        opties.Add(System.IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.CommonDocuments), _
+            "Autodesk", "Inventor 2026", "Content Center Files"))
+        opties.Add(System.IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.MyDocuments), _
+            "Inventor", "Content Center Files"))
+        For Each pad As String In opties
+            If Directory.Exists(pad) Then Return pad
+        Next
+    Catch
+    End Try
+    Try
+        Using fbd As New FolderBrowserDialog()
+            fbd.Description = "Selecteer de map met de Content Center bestanden (.ipt) van het project."
+            If fbd.ShowDialog() = DialogResult.OK Then Return fbd.SelectedPath
+        End Using
+    Catch
+    End Try
+    Return Nothing
+End Function
+
+Sub ZoekIPTBestanden(startMap As String, lijst As List(Of CCBestand))
+    Try
+        For Each f As String In Directory.GetFiles(startMap, "*.ipt")
+            Dim b As New CCBestand
+            b.Pad = f
+            b.Naam = System.IO.Path.GetFileNameWithoutExtension(f)
+            lijst.Add(b)
+        Next
+    Catch
+    End Try
+    Try
+        For Each d As String In Directory.GetDirectories(startMap)
+            ZoekIPTBestanden(d, lijst)
+        Next
+    Catch
+    End Try
+End Sub
+
+Sub VervangInAssembly(oOccs As ComponentOccurrences, oud As String, nieuw As String, ByRef aantal As Integer, mislukt As List(Of String))
+    Dim treffers As New List(Of ComponentOccurrence)
+    VerzamelTrefferOccs(oOccs, oud, treffers)
+    For Each oOcc As ComponentOccurrence In treffers
+        Try
+            oOcc.Replace(nieuw, False)
+            aantal = aantal + 1
+        Catch
+            mislukt.Add(oud)
+        End Try
+    Next
+End Sub
+
+Sub VerzamelTrefferOccs(oOccs As ComponentOccurrences, padOud As String, treffers As List(Of ComponentOccurrence))
+    For Each oOcc As ComponentOccurrence In oOccs
+        If oOcc.Suppressed Then Continue For
+        Try
+            Dim oDef As ComponentDefinition = oOcc.Definition
+            If oDef Is Nothing Then Continue For
+            Dim oDoc As Document = oDef.Document
+            If oDoc Is Nothing Then Continue For
+            If oDoc.DocumentType = DocumentTypeEnum.kAssemblyDocumentObject AndAlso oOcc.SubOccurrences IsNot Nothing Then
+                VerzamelTrefferOccs(oOcc.SubOccurrences, padOud, treffers)
+            ElseIf String.Compare(oDoc.FullFileName, padOud, True) = 0 Then
+                treffers.Add(oOcc)
+            End If
+        Catch
+        End Try
+    Next
+End Sub
+
+' ============================ Hulpklassen ============================
+
+Class CCBestand
+    Public Naam As String
+    Public Pad As String
+    Public Overrides Function ToString() As String
+        Return Naam
+    End Function
+End Class
+
+Class CCBestandComparer
+    Implements IComparer(Of CCBestand)
+    Public Function Compare(x As CCBestand, y As CCBestand) As Integer Implements IComparer(Of CCBestand).Compare
+        Return String.Compare(x.Pad, y.Pad, True)
+    End Function
+End Class
+
+Class CCRij
+    Public Pad As String
+    Public Bestandsnaam As String
+    Public Partnummer As String
+    Public Omschrijving As String
+    Public Familie As String
+    Public Aantal As Integer
+End Class
+
+Class CCKnoop
+    Public Soort As String        ' "categorie" of "familie"
+    Public ObjectRef As Object
+End Class
+
+Class CCRowItem
+    Public Tekst As String
+    Public Row As Object
+    Public Overrides Function ToString() As String
+        Return Tekst
+    End Function
+End Class
+
+' ============================ Formulier ============================
+
+Class CCForm
+    Inherits System.Windows.Forms.Form
+
+    Private _rijen As List(Of CCRij)
+    Private _bestanden As List(Of CCBestand)
+    Private _ccMap As String
+    Private _ccTopNode As Object
+    Private _grid As DataGridView
+    Private _lblInfo As Label
+    Private _btnUitvoeren As Button
+    Private _btnAnnuleren As Button
+    Friend Vervangingen As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+    Public Sub New(rijen As List(Of CCRij), bestanden As List(Of CCBestand), ccMap As String, ccTopNode As Object)
+        _rijen = rijen
+        _bestanden = bestanden
+        _ccMap = ccMap
+        _ccTopNode = ccTopNode
+        BouwFormulier()
+        VulGrid()
+    End Sub
+
+    Private Sub BouwFormulier()
+        Me.Text = "Content Center delen vervangen"
+        Me.ClientSize = New System.Drawing.Size(1000, 620)
+        Me.StartPosition = FormStartPosition.CenterScreen
+        Me.TopMost = True
+        Me.Font = New System.Drawing.Font("Segoe UI", 9)
+
+        _btnUitvoeren = New Button()
+        _btnUitvoeren.Text = "Uitvoeren"
+        _btnUitvoeren.Size = New System.Drawing.Size(110, 34)
+        _btnUitvoeren.Location = New System.Drawing.Point(758, 9)
+        _btnUitvoeren.Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+        AddHandler _btnUitvoeren.Click, AddressOf UitvoerenClick
+
+        _btnAnnuleren = New Button()
+        _btnAnnuleren.Text = "Annuleren"
+        _btnAnnuleren.Size = New System.Drawing.Size(110, 34)
+        _btnAnnuleren.Location = New System.Drawing.Point(876, 9)
+        _btnAnnuleren.Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+        AddHandler _btnAnnuleren.Click, AddressOf AnnulerenClick
+
+        _lblInfo = New Label()
+        _lblInfo.Location = New System.Drawing.Point(10, 16)
+        _lblInfo.Size = New System.Drawing.Size(740, 24)
+        _lblInfo.Anchor = AnchorStyles.Left Or AnchorStyles.Bottom
+
+        Dim pnlOnder As New Panel()
+        pnlOnder.Location = New System.Drawing.Point(0, 568)
+        pnlOnder.Size = New System.Drawing.Size(1000, 52)
+        pnlOnder.Anchor = AnchorStyles.Bottom Or AnchorStyles.Left Or AnchorStyles.Right
+        pnlOnder.Controls.Add(_lblInfo)
+        pnlOnder.Controls.Add(_btnUitvoeren)
+        pnlOnder.Controls.Add(_btnAnnuleren)
+
+        _grid = New DataGridView()
+        _grid.Location = New System.Drawing.Point(0, 0)
+        _grid.Size = New System.Drawing.Size(1000, 568)
+        _grid.Anchor = AnchorStyles.Top Or AnchorStyles.Bottom Or AnchorStyles.Left Or AnchorStyles.Right
+        _grid.AllowUserToAddRows = False
+        _grid.AllowUserToDeleteRows = False
+        _grid.RowHeadersVisible = False
+        _grid.SelectionMode = DataGridViewSelectionMode.CellSelect
+        _grid.BackgroundColor = System.Drawing.Color.White
+        _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells
+        AddHandler _grid.CellContentClick, AddressOf GridCellContentClick
+        AddHandler _grid.DataError, AddressOf GridDataError
+
+        Dim c1 As New DataGridViewTextBoxColumn()
+        c1.Name = "Huidig"
+        c1.HeaderText = "Huidig Content Center onderdeel"
+        c1.ReadOnly = True
+        c1.Width = 280
+        c1.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
+
+        Dim c2 As New DataGridViewTextBoxColumn()
+        c2.Name = "Aantal"
+        c2.HeaderText = "Plaatsen"
+        c2.ReadOnly = True
+        c2.Width = 62
+        c2.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
+
+        Dim c3 As New DataGridViewTextBoxColumn()
+        c3.Name = "Familie"
+        c3.HeaderText = "CC-familie"
+        c3.ReadOnly = True
+        c3.Width = 170
+
+        Dim c4 As New DataGridViewComboBoxColumn()
+        c4.Name = "Vervangend"
+        c4.HeaderText = "Vervangend onderdeel"
+        c4.Width = 230
+        c4.FlatStyle = FlatStyle.Flat
+        c4.DropDownWidth = 450
+        c4.ValueType = GetType(CCBestand)
+        For Each b As CCBestand In _bestanden
+            c4.Items.Add(b)
+        Next
+
+        Dim c5 As New DataGridViewButtonColumn()
+        c5.Name = "CCKeuze"
+        c5.HeaderText = "Uit CC-library"
+        c5.Text = "CC-keuze..."
+        c5.UseColumnTextForButtonValue = True
+        c5.Width = 110
+
+        Dim c6 As New DataGridViewButtonColumn()
+        c6.Name = "Blader"
+        c6.HeaderText = "Van schijf"
+        c6.Text = "Bladeren..."
+        c6.UseColumnTextForButtonValue = True
+        c6.Width = 90
+
+        _grid.Columns.AddRange(New DataGridViewColumn() {c1, c2, c3, c4, c5, c6})
+
+        Me.Controls.Add(pnlOnder)
+        Me.Controls.Add(_grid)
+        Me.AcceptButton = _btnUitvoeren
+        Me.CancelButton = _btnAnnuleren
+    End Sub
+
+    Private Sub VulGrid()
+        For Each r As CCRij In _rijen
+            Dim idx As Integer = _grid.Rows.Add()
+            Dim row As DataGridViewRow = _grid.Rows(idx)
+            row.Tag = r
+            row.Cells("Huidig").Value = r.Partnummer & " — " & r.Bestandsnaam & " (" & r.Omschrijving & ")"
+            row.Cells("Aantal").Value = CStr(r.Aantal)
+            row.Cells("Familie").Value = r.Familie
+            row.Cells("Huidig").ToolTipText = r.Pad
+        Next
+        _lblInfo.Text = _rijen.Count & " uniek(e) CC-onderdeel(en) | " & _bestanden.Count & _
+            " bestanden in CC-map | kies per regel via 'CC-keuze...' of de lijst."
+    End Sub
+
+    Private Sub GridCellContentClick(sender As Object, e As DataGridViewCellEventArgs)
+        If e.RowIndex < 0 Then Return
+
+        If _grid.Columns(e.ColumnIndex).Name = "CCKeuze" Then
+            If _ccTopNode Is Nothing Then
+                MessageBox.Show("De Content Center-bibliotheek is niet beschikbaar." & vbCrLf & _
+                    "Controleer of de libraries in gebruik zijn in het project.", "Content Center", _
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                Return
+            End If
+            Dim browser As New CCBrowser(_ccTopNode)
+            If browser.ShowDialog(Me) = DialogResult.OK AndAlso browser.GekozenPad <> "" Then
+                Dim b As CCBestand = ZoekBestand(browser.GekozenPad)
+                If b Is Nothing Then
+                    b = New CCBestand
+                    b.Pad = browser.GekozenPad
+                    b.Naam = System.IO.Path.GetFileNameWithoutExtension(b.Pad)
+                    _bestanden.Add(b)
+                    CType(_grid.Columns("Vervangend"), DataGridViewComboBoxColumn).Items.Add(b)
+                End If
+                _grid.Rows(e.RowIndex).Cells("Vervangend").Value = b
+            End If
+
+        ElseIf _grid.Columns(e.ColumnIndex).Name = "Blader" Then
+            Using ofd As New OpenFileDialog()
+                ofd.Title = "Kies een vervangend Content Center bestand"
+                ofd.Filter = "Inventor onderdeel (*.ipt)|*.ipt"
+                If _ccMap IsNot Nothing AndAlso Directory.Exists(_ccMap) Then ofd.InitialDirectory = _ccMap
+                If ofd.ShowDialog(Me) = DialogResult.OK Then
+                    Dim gekozen As CCBestand = ZoekBestand(ofd.FileName)
+                    If gekozen Is Nothing Then
+                        MessageBox.Show("Het gekozen bestand ligt niet in de Content Center map.", _
+                            "Niet toegestaan", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                    Else
+                        _grid.Rows(e.RowIndex).Cells("Vervangend").Value = gekozen
+                    End If
+                End If
+            End Using
+        End If
+    End Sub
+
+    Private Function ZoekBestand(pad As String) As CCBestand
+        For Each b As CCBestand In _bestanden
+            If String.Compare(b.Pad, pad, True) = 0 Then Return b
+        Next
+        Return Nothing
+    End Function
+
+    Private Sub UitvoerenClick(sender As Object, e As EventArgs)
+        Vervangingen.Clear()
+        Dim onvolledig As Integer = 0
+        For Each row As DataGridViewRow In _grid.Rows
+            Dim r As CCRij = TryCast(row.Tag, CCRij)
+            If r Is Nothing Then Continue For
+            Dim b As CCBestand = TryCast(row.Cells("Vervangend").Value, CCBestand)
+            If b Is Nothing Then
+                onvolledig = onvolledig + 1
+            ElseIf String.Compare(r.Pad, b.Pad, True) <> 0 Then
+                Vervangingen(r.Pad) = b.Pad
+            End If
+        Next
+
+        If onvolledig > 0 Then
+            If MessageBox.Show(onvolledig & " regel(s) hebben nog geen vervangend onderdeel." & vbCrLf & _
+                "Alleen de volledige regels uitvoeren?", "Onvolledig", _
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) <> DialogResult.Yes Then Return
+        End If
+        If Vervangingen.Count = 0 Then
+            MessageBox.Show("Geen vervangingen geselecteerd.", "Content Center vervang-tool", _
+                MessageBoxButtons.OK, MessageBoxIcon.Information)
+            Return
+        End If
+
+        Me.DialogResult = DialogResult.OK
+        Me.Close()
+    End Sub
+
+    Private Sub AnnulerenClick(sender As Object, e As EventArgs)
+        Me.DialogResult = DialogResult.Cancel
+        Me.Close()
+    End Sub
+
+    Private Sub GridDataError(sender As Object, e As DataGridViewDataErrorEventArgs)
+        e.ThrowException = False
+    End Sub
+End Class
+
+' ============================ CC-bibliotheekbrowser ============================
+
+Class CCBrowser
+    Inherits System.Windows.Forms.Form
+
+    Private _ccTopNode As Object
+    Private _tree As TreeView
+    Private _list As ListBox
+    Private _lblFamilie As Label
+    Private _txtDetail As System.Windows.Forms.TextBox
+    Private _btnOK As Button
+    Private _btnCancel As Button
+    Friend GekozenPad As String = ""
+
+    Public Sub New(ccTopNode As Object)
+        _ccTopNode = ccTopNode
+        BouwFormulier()
+        LaadBoom()
+    End Sub
+
+    Private Sub BouwFormulier()
+        Me.Text = "Kies een onderdeel uit het Content Center"
+        Me.ClientSize = New System.Drawing.Size(760, 500)
+        Me.StartPosition = FormStartPosition.CenterParent
+        Me.TopMost = True
+        Me.Font = New System.Drawing.Font("Segoe UI", 9)
+
+        _tree = New TreeView()
+        _tree.Location = New System.Drawing.Point(8, 8)
+        _tree.Size = New System.Drawing.Size(300, 440)
+        _tree.Anchor = AnchorStyles.Top Or AnchorStyles.Bottom Or AnchorStyles.Left
+        AddHandler _tree.BeforeExpand, AddressOf TreeBeforeExpand
+        AddHandler _tree.AfterSelect, AddressOf TreeAfterSelect
+
+        _lblFamilie = New Label()
+        _lblFamilie.Location = New System.Drawing.Point(316, 8)
+        _lblFamilie.Size = New System.Drawing.Size(436, 20)
+        _lblFamilie.Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+        _lblFamilie.Text = "(selecteer links een familie)"
+
+        _list = New ListBox()
+        _list.Location = New System.Drawing.Point(316, 32)
+        _list.Size = New System.Drawing.Size(436, 304)
+        _list.Anchor = AnchorStyles.Top Or AnchorStyles.Bottom Or AnchorStyles.Left Or AnchorStyles.Right
+        AddHandler _list.SelectedIndexChanged, AddressOf LijstSelectieWijziging
+        AddHandler _list.DoubleClick, AddressOf OKClick
+
+        _txtDetail = New System.Windows.Forms.TextBox()
+        _txtDetail.Location = New System.Drawing.Point(316, 344)
+        _txtDetail.Size = New System.Drawing.Size(436, 104)
+        _txtDetail.Anchor = AnchorStyles.Bottom Or AnchorStyles.Left Or AnchorStyles.Right
+        _txtDetail.Multiline = True
+        _txtDetail.ReadOnly = True
+        _txtDetail.ScrollBars = ScrollBars.Vertical
+
+        _btnOK = New Button()
+        _btnOK.Text = "Gebruik dit onderdeel"
+        _btnOK.Size = New System.Drawing.Size(160, 32)
+        _btnOK.Location = New System.Drawing.Point(468, 456)
+        _btnOK.Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+        AddHandler _btnOK.Click, AddressOf OKClick
+
+        _btnCancel = New Button()
+        _btnCancel.Text = "Annuleren"
+        _btnCancel.Size = New System.Drawing.Size(110, 32)
+        _btnCancel.Location = New System.Drawing.Point(636, 456)
+        _btnCancel.Anchor = AnchorStyles.Bottom Or AnchorStyles.Right
+        AddHandler _btnCancel.Click, AddressOf AnnulerenClick
+
+        Me.Controls.Add(_tree)
+        Me.Controls.Add(_lblFamilie)
+        Me.Controls.Add(_list)
+        Me.Controls.Add(_txtDetail)
+        Me.Controls.Add(_btnOK)
+        Me.Controls.Add(_btnCancel)
+        Me.CancelButton = _btnCancel
+    End Sub
+
+    Private Sub LaadBoom()
+        Try
+            _tree.BeginUpdate()
+            For Each kind As Object In _ccTopNode.ChildNodes
+                VoegCategorieToe(kind)
+            Next
+        Catch ex As Exception
+            MessageBox.Show("Kon de Content Center-library niet lezen:" & vbCrLf & ex.Message, _
+                "Content Center", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        Finally
+            _tree.EndUpdate()
+        End Try
+        If _tree.Nodes.Count = 0 Then
+            MessageBox.Show("Geen libraries gevonden. Controleer of er libraries 'in gebruik' zijn in het project.", _
+                "Content Center", MessageBoxButtons.OK, MessageBoxIcon.Information)
+        End If
+    End Sub
+
+    Private Sub VoegCategorieToe(cat As Object)
+        Try
+            Dim k As New CCKnoop
+            k.Soort = "categorie"
+            k.ObjectRef = cat
+            Dim n As New TreeNode(CStr(cat.DisplayName))
+            n.Tag = k
+            n.Nodes.Add("lading...")
+            _tree.Nodes.Add(n)
+        Catch
+        End Try
+    End Sub
+
+    Private Sub TreeBeforeExpand(sender As Object, e As TreeViewCancelEventArgs)
+        Dim k As CCKnoop = TryCast(e.Node.Tag, CCKnoop)
+        If k Is Nothing Then Return
+        If k.Soort <> "categorie" Then Return
+        If e.Node.Nodes.Count = 1 AndAlso e.Node.Nodes(0).Text = "lading..." Then
+            e.Node.Nodes.Clear()
+            Try
+                For Each kind As Object In k.ObjectRef.ChildNodes
+                    VoegSubCategorieToe(e.Node, kind)
+                Next
+            Catch
+            End Try
+            Try
+                For Each fam As Object In k.ObjectRef.Families
+                    VoegFamilieToe(e.Node, fam)
+                Next
+            Catch
+            End Try
+        End If
+    End Sub
+
+    Private Sub VoegSubCategorieToe(ouder As TreeNode, cat As Object)
+        Try
+            Dim k As New CCKnoop
+            k.Soort = "categorie"
+            k.ObjectRef = cat
+            Dim n As New TreeNode(CStr(cat.DisplayName))
+            n.Tag = k
+            n.Nodes.Add("lading...")
+            ouder.Nodes.Add(n)
+        Catch
+        End Try
+    End Sub
+
+    Private Sub VoegFamilieToe(ouder As TreeNode, fam As Object)
+        Try
+            Dim k As New CCKnoop
+            k.Soort = "familie"
+            k.ObjectRef = fam
+            Dim n As New TreeNode(CStr(fam.DisplayName))
+            n.Tag = k
+            ouder.Nodes.Add(n)
+        Catch
+        End Try
+    End Sub
+
+    Private Sub TreeAfterSelect(sender As Object, e As TreeViewEventArgs)
+        Dim k As CCKnoop = TryCast(e.Node.Tag, CCKnoop)
+        If k Is Nothing Then Return
+        If k.Soort = "familie" Then
+            VulRijen(k.ObjectRef)
+        Else
+            _list.Items.Clear()
+            _lblFamilie.Text = "(selecteer links een familie)"
+            _txtDetail.Text = ""
+        End If
+    End Sub
+
+    Private Sub VulRijen(fam As Object)
+        Me.UseWaitCursor = True
+        _list.Items.Clear()
+        _txtDetail.Text = ""
+        Try
+            _lblFamilie.Text = CStr(fam.DisplayName)
+            Dim n As Integer = 0
+            For Each rij As Object In fam.TableRows
+                Dim it As New CCRowItem
+                it.Row = rij
+                it.Tekst = RowTekst(rij, n)
+                _list.Items.Add(it)
+                n = n + 1
+            Next
+            If n = 0 Then _lblFamilie.Text = CStr(fam.DisplayName) & " (geen maten)"
+        Catch ex As Exception
+            _lblFamilie.Text = "Kon rijen niet lezen: " & ex.Message
+        Finally
+            Me.UseWaitCursor = False
+        End Try
+    End Sub
+
+    Private Function RowTekst(rij As Object, idx As Integer) As String
+        Dim omschrijving As String = GeefCelwaardeMulti(rij, New String() {"description", "omschrijving", "beschrijving"})
+        Dim bestandsnaam As String = GeefCelwaardeMulti(rij, New String() {"filename", "file name", "bestandsnaam"})
+        Dim pn As String = GeefCelwaardeMulti(rij, New String() {"part number", "partnummer"})
+
+        Dim stukken As New List(Of String)
+        If omschrijving <> "" Then stukken.Add(omschrijving)
+        If pn <> "" Then stukken.Add(pn)
+        If bestandsnaam <> "" Then
+            Dim naamZonderExt As String = bestandsnaam
+            If LCase(naamZonderExt).EndsWith(".ipt") Then naamZonderExt = naamZonderExt.Substring(0, naamZonderExt.Length - 4)
+            stukken.Add(naamZonderExt)
+        End If
+
+        If stukken.Count = 0 Then
+            Dim t As String = ""
+            Try
+                t = CStr(rij.MemberName)
+            Catch
+            End Try
+            If t = "" Then t = "Rij " & CStr(idx + 1)
+            Return t
+        End If
+        Return String.Join("  |  ", stukken.ToArray())
+    End Function
+
+    Private Function GeefCelwaardeMulti(rij As Object, sleutelwoorden As String()) As String
+        Try
+            For Each cel As Object In rij.Cells
+                Dim kolom As String = ""
+                Try
+                    kolom = LCase(CStr(cel.Column.DisplayName))
+                Catch
+                    Try
+                        kolom = LCase(CStr(cel.Column.HeaderName))
+                    Catch
+                    End Try
+                End Try
+                If kolom <> "" Then
+                    For Each s As String In sleutelwoorden
+                        If kolom.Contains(LCase(s)) Then
+                            Return CStr(cel.Value)
+                        End If
+                    Next
+                End If
+            Next
+        Catch
+        End Try
+        Return ""
+    End Function
+
+    Private Sub LijstSelectieWijziging(sender As Object, e As EventArgs)
+        Dim it As CCRowItem = TryCast(_list.SelectedItem, CCRowItem)
+        If it Is Nothing Then
+            _txtDetail.Text = ""
+            Return
+        End If
+        Dim sb As String = ""
+        Dim n As Integer = 0
+        Try
+            For Each cel As Object In it.Row.Cells
+                Dim kolom As String = ""
+                Try
+                    kolom = CStr(cel.Column.DisplayName)
+                Catch
+                    Try
+                        kolom = CStr(cel.Column.HeaderName)
+                    Catch
+                    End Try
+                End Try
+                Dim val As String = ""
+                Try
+                    val = CStr(cel.Value)
+                Catch
+                End Try
+                sb = sb & kolom & " = " & val & vbCrLf
+                n = n + 1
+                If n >= 20 Then Exit For
+            Next
+        Catch
+        End Try
+        _txtDetail.Text = sb
+    End Sub
+
+    Private Sub OKClick(sender As Object, e As EventArgs)
+        Dim it As CCRowItem = TryCast(_list.SelectedItem, CCRowItem)
+        If it Is Nothing Then
+            MessageBox.Show("Selecteer allereerst een maat (rij) uit een familie.", _
+                "Content Center", MessageBoxButtons.OK, MessageBoxIcon.Information)
+            Return
+        End If
+        Me.UseWaitCursor = True
+        Try
+            Dim reden As Object = Nothing
+            Dim msg As String = ""
+            Dim fam As Object = _GekFamilie()
+            Dim pad As String = CStr(fam.CreateMember(it.Row, reden, msg))
+            If pad Is Nothing OrElse pad = "" Then
+                MessageBox.Show("Kon het onderdeel niet genereren." & vbCrLf & msg, _
+                    "Content Center", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                Return
+            End If
+            GekozenPad = pad
+            Me.DialogResult = DialogResult.OK
+            Me.Close()
+        Catch ex As Exception
+            MessageBox.Show("Kon het onderdeel niet genereren:" & vbCrLf & ex.Message, _
+                "Content Center", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        Finally
+            Me.UseWaitCursor = False
+        End Try
+    End Sub
+
+    Private Function _GekFamilie() As Object
+        Dim knoop As TreeNode = _tree.SelectedNode
+        If knoop Is Nothing Then Return Nothing
+        Dim k As CCKnoop = TryCast(knoop.Tag, CCKnoop)
+        If k Is Nothing OrElse k.Soort <> "familie" Then Return Nothing
+        Return k.ObjectRef
+    End Function
+
+    Private Sub AnnulerenClick(sender As Object, e As EventArgs)
+        Me.DialogResult = DialogResult.Cancel
+        Me.Close()
+    End Sub
+End Class
